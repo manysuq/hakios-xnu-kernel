@@ -1249,6 +1249,80 @@ ufs_crc32(const uint8_t *p, uint64_t n)
  * partitions. Whatever firmware is on the phone, the bytes read are the bytes on the flash only if
  * both come out right -- the one check here that does not depend on having the same images.
  */
+
+/* the userdata partition, by GPT name (the raw root image lives at its start) */
+static efi_block_io *
+find_userdata_partition(void)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	static const char16 want[] = u"userdata";
+	efi_handle *handles;
+	uint64_t count;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		return NULL;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		int match = 1;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
+			continue;
+		}
+		for (unsigned k = 0; k < sizeof(want) / sizeof(want[0]); k++) {
+			if (info->name[k] != want[k]) {
+				match = 0;
+				break;
+			}
+		}
+		if (match && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			return bio;
+		}
+	}
+	return NULL;
+}
+
+/* Read the root ramdisk image from the start of the userdata partition into
+ * pa (size is already rounded up to a page multiple). */
+static int
+read_ufs_ramdisk(uint64_t pa, uint64_t size)
+{
+	efi_block_io *bio = find_userdata_partition();
+
+	if (bio == NULL) {
+		print("ufs ramdisk: userdata partition not found\n");
+		return 0;
+	}
+	uint64_t bs = bio->media->block_size, mid = bio->media->media_id;
+	if (bs == 0 || bs > 4096 || (bio->media->last_block + 1) * bs < size) {
+		print("ufs ramdisk: bad partition (bs %x, %x bytes)\n", bs, (bio->media->last_block + 1) * bs);
+		return 0;
+	}
+	print("ufs ramdisk: reading %x bytes from userdata (bs %x)...\n", size, bs);
+	uint64_t off = 0, next_report = 0;
+	while (off < size) {
+		uint64_t chunk = size - off;
+		if (chunk > (1u << 20)) {
+			chunk = 1u << 20;
+		}
+		efi_status s = bio->read_blocks(bio, mid, off / bs, chunk, (void *)(pa + off));
+		if (EFI_ERROR(s)) {
+			print("ufs ramdisk: read at %x: error %x\n", off, (uint64_t)s);
+			return 0;
+		}
+		off += chunk;
+		wdt_pet();
+		if (off >= next_report) {
+			print("ufs ramdisk: %x / %x\n", off, size);
+			next_report += 0x10000000ULL;
+		}
+	}
+	print("ufs ramdisk: done\n");
+	return 1;
+}
+
 static void
 ufs_check_gpt(efi_block_io *bio, uint64_t unit)
 {
@@ -2499,6 +2573,62 @@ wdt_arm(void)
 	wdt_armed = (r_pet == 0);
 }
 
+static void
+enable_ldoa28(void)
+{
+	volatile uint32_t *base = (volatile uint32_t *)(0x179e0000ULL + 0xd00ULL);
+
+	/* Wait up to 1ms for TCS 0 to become IDLE */
+	for (int i = 0; i < 1000; i++) {
+		if (base[0x18 / 4] != 0) {
+			break;
+		}
+		BS->stall(10);
+	}
+
+	uint32_t msgid = 8u | (1u << 8) | (1u << 16);
+
+	/* CMD 0: set voltage 3300 mV to VRM address 0x42100 */
+	base[(0x30 + 0) / 4] = msgid;
+	base[(0x34 + 0) / 4] = 0x42100;
+	base[(0x38 + 0) / 4] = 3300;
+
+	/* CMD 1: set enable 1 to VRM address 0x42104 */
+	base[(0x30 + 20) / 4] = msgid;
+	base[(0x34 + 20) / 4] = 0x42104;
+	base[(0x38 + 20) / 4] = 1;
+
+	/* Both commands must complete */
+	base[0x10 / 4] = 0x3;
+	base[0x1c / 4] = 0x3;
+
+	/* Trigger AMC on TCS 0 */
+	uint32_t ctl = base[0x14 / 4];
+	ctl &= ~(1u << 24);
+	base[0x14 / 4] = ctl;
+	ctl &= ~(1u << 16);
+	base[0x14 / 4] = ctl;
+
+	ctl = (1u << 16);
+	base[0x14 / 4] = ctl;
+	ctl |= (1u << 24);
+	base[0x14 / 4] = ctl;
+
+	/* Wait up to 10ms for TCS 0 IRQ completion */
+	for (int i = 0; i < 1000; i++) {
+		if (base[0x04 / 4] & 1) {
+			break;
+		}
+		BS->stall(10);
+	}
+
+	/* Clear IRQ and disable AMC mode */
+	base[0x08 / 4] = 1;
+	base[0x14 / 4] = 0;
+
+	print("power: dipper PM8998 LDO28 (3.3V) enabled via RPMh RSC\n");
+}
+
 /* ------------------------------------------------------------------------ */
 /* UEFI exception hook: put the fault into the log instead of on the screen  */
 
@@ -2547,6 +2677,7 @@ struct payload_info {
 	uint64_t checkpoint;
 	uint64_t forced_base;
 	uint64_t resident_rd;           /* size of a root image the host put at the resident address */
+	uint64_t ufs_rd;                /* size of a root image stored raw at the start of the userdata partition */
 	int usb_mode;
 };
 
@@ -2596,6 +2727,8 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->forced_base = parse_number(text, 16); /* testing aid; must be free RAM */
 		} else if (str_eq(e->name, "rdres")) {
 			pi->resident_rd = parse_number(text, 16); /* e.g. loaded there by QEMU; see RESIDENT_RD_OFFSET */
+		} else if (str_eq(e->name, "ufsrd")) {
+			pi->ufs_rd = parse_number(text, 16);      /* root image raw at the start of the userdata partition */
 		} else if (str_eq(e->name, "checkpoint")) {
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "usb")) {
@@ -2834,11 +2967,16 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t rd_pa = kern_hi;
 	uint64_t rd_size = (pi.ramdisk_size + PAGE_SIZE_MAX - 1) & ~(PAGE_SIZE_MAX - 1);
 	int rd_resident = 0;
+	int rd_from_ufs = 0;
 	/* A resident image next to a payload ramdisk: two disks (which is which is decided where the device tree is written). */
 	uint64_t rd1_pa = 0, rd1_size = 0;
 
 	if (pi.resident_rd != 0) {
 		resident_rd_size = pi.resident_rd;
+	}
+	if (pi.ufs_rd != 0 && resident_rd_size == 0) {
+		resident_rd_size = pi.ufs_rd;   /* the resident area is filled from UFS below */
+		rd_from_ufs = 1;
 	}
 	if (resident_rd_size != 0) {
 		uint64_t res_pa = phys_base + RESIDENT_RD_OFFSET;
@@ -2888,6 +3026,12 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	if (rd1_size != 0) {
 		print("resident image at pa %x size %x: it is the root (md0), the payload ramdisk is md1\n", rd1_pa, rd1_size);
+	}
+	if (rd_from_ufs) {
+		if (rd1_size == 0 || !read_ufs_ramdisk(rd1_pa, rd1_size)) {
+			print("ufs ramdisk: could not load the root image\n");
+			return 0;
+		}
 	}
 
 	/* "bootcpu=N" among the kernel's arguments: run it on core N (see run_on_other_cpu) */
@@ -3590,6 +3734,9 @@ usb_wait(uint8_t endpoint)
 		if (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
 			last_pet = READ_SYSREG(CNTVCT_EL0);
 			wdt_pet();
+			if (charger_enabled) {
+				charger_poll();
+			}
 		}
 	}
 }
@@ -4013,6 +4160,7 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	install_exception_hook();
 	wdt_arm();
+
 
 	int have_payload = parse_payload(&pi, 0);
 	if (have_payload && pi.usb_mode && usb_start()) {

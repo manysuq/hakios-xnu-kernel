@@ -200,13 +200,24 @@ flash_root(const char *dev)
 	if (!ok) {
 		return;
 	}
-	check(synthetic_dir("/flash/redwood"), "a synthetic /redwood on it, for this image");
-	check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
-	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
-	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
-	    "our audio device, not Apple's plug-ins");
+	struct stat rst;
+	if (stat("/flash/redwood", &rst) != 0) {
+		check(synthetic_dir("/flash/redwood"), "a synthetic /redwood on it, for this image");
+	} else {
+		check(1, "existing /redwood directory on /flash");
+	}
+	if (stat("/flash/System/Library/LaunchDaemons", &rst) == 0 && (rst.st_mode & S_IFMT) == S_IFDIR) {
+		check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
+		    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
+		    bind_dir(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
+		    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
+	} else {
+		check(1, "LaunchDaemons symlinked to /redwood on /flash");
+	}
+	if (stat("/flash/System/Library/Audio/Plug-Ins/HAL", &rst) == 0 && (rst.st_mode & S_IFMT) == S_IFDIR) {
+		check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
+		    "our audio device, not Apple's plug-ins");
+	}
 	if (stat("/fw", &fw_st) == 0) {
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */
 		check(synthetic_dir("/flash/fw") && bind_dir("/fw", "/flash/fw"), "the firmware on /fw (adsp=1, sound=N)");
@@ -274,8 +285,7 @@ flash_root(const char *dev)
 	 */
 	mount_cryptex("OS", ",c=1", devpath);
 	mount_cryptex("App", ",c=2", devpath);
-	struct stat rst;
-	if (stat("/private/preboot/redwood", &rst) == 0 && (rst.st_mode & S_IFMT) == S_IFDIR) {
+	if (stat("/private/preboot/redwood/etc", &rst) == 0 && (rst.st_mode & S_IFMT) == S_IFDIR) {
 		check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
 	} else {
 		check(bind_dir("/private/preboot", "/redwood"), "this image back on /redwood");
@@ -1287,6 +1297,7 @@ run_rc(const char *path)
 	static char script[65536];
 
 	if (read_whole(path, script, sizeof(script)) < 0) {
+		printf("run_rc: cannot read %s: %s\n", path, strerror(errno));
 		return;
 	}
 
@@ -1472,10 +1483,34 @@ main(int argc, char **argv, char **envp)
 	printf("\n=== %d checks, %d failed ===\n", checks, failures);
 	/* daemons that do not run as root get the console as their standard error too */
 	chmod("/dev/console", 0666);
+	const char *i2ctest_arg = boot_arg("i2ctest");
+	if (i2ctest_arg) {
+		const char *cmd = join(in_image("/bin/i2ctest"), " ", i2ctest_arg);
+		char cmdbuf[256];
+		strcpy(cmdbuf, cmd);
+		printf("\n=== running i2ctest: %s ===\n", cmdbuf);
+		run_command(cmdbuf);
+	}
 	configure_inject();
 	configure_vnodes();
+
+	if (boot_arg("touch_test") != NULL) {
+		printf("\n=== touch_test mode active: skipping iOS boot, keeping system alive for touch testing ===\n");
+		printf("=== trace on screen or test via /dev/hakios-touch ===\n");
+		for (;;) {
+			usleep(1000000);
+		}
+	}
+
 	run_rc(in_image("/etc/rc"));
-	printf("\n=== init: done ===\n");
-	reboot(RB_HALT);
+	if (flash_root_mode) {
+		printf("init: fallback direct launch of launchd.ios\n");
+		char exec_cmd[64] = "exec /sbin/launchd.ios";
+		run_command(exec_cmd);
+	}
+	printf("\n=== init: staying alive ===\n");
+	for (;;) {
+		usleep(1000000);
+	}
 	return failures != 0;
 }

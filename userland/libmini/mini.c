@@ -50,6 +50,12 @@ close(int fd)
 	return (int)SC(SYS_close, fd, 0, 0, 0, 0, 0);
 }
 
+int
+ioctl(int fd, unsigned long request, void *arg)
+{
+	return (int)SC(SYS_ioctl, fd, request, arg, 0, 0, 0);
+}
+
 off_t
 lseek(int fd, off_t offset, int whence)
 {

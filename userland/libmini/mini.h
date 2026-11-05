@@ -129,6 +129,7 @@ ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
 int     open(const char *path, int flags, int mode);
 int     close(int fd);
+int     ioctl(int fd, unsigned long request, void *arg);
 off_t   lseek(int fd, off_t offset, int whence);
 int     dup2(int from, int to);
 int     chdir(const char *path);

@@ -16,6 +16,7 @@ ap.add_argument('--cmdline', default='')
 ap.add_argument('--physbase', default='', help='hex: force XNU physical base (testing)')
 ap.add_argument('--usb', action='store_true', help='make the loader stay resident and take commands over USB')
 ap.add_argument('--rdres', default='', help='hex size of a root image already placed at the resident address (QEMU)')
+ap.add_argument('--ufsrd', default='', help='hex size of a root image stored raw at the start of the userdata partition')
 ap.add_argument('--checkpoint', default='', help='kernel checkpoint to stop at; 999 = loader self test')
 ap.add_argument('items', nargs='*')
 args = ap.parse_args()
@@ -34,6 +35,8 @@ if args.physbase:
     add('physbase', args.physbase.lower().replace('0x', '').encode() + b'\0')
 if args.rdres:
     add('rdres', args.rdres.lower().replace('0x', '').encode() + b'\0')
+if args.ufsrd:
+    add('ufsrd', args.ufsrd.lower().replace('0x', '').encode() + b'\0')
 if args.usb:
     add('usb', b'1\0')
 if args.checkpoint:
